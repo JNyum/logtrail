@@ -1,0 +1,48 @@
+service:
+  flush: 1
+  daemon: off
+  log_level: info
+  parsers_file: /fluent-bit/etc/parsers.conf
+
+pipeline:
+  inputs:
+    - name: tail
+      tag: corekeeper.log
+      path: /var/log/corekeeper/Log.txt
+      read_from_head: true
+      refresh_interval: 1
+      mem_buf_limit: 10MB
+      skip_long_lines: on
+      db: /fluent-bit/state/corekeeper.db
+      db.sync: normal
+
+  filters:
+    # 1) 키워드 필터: 접속/퇴장 관련만 통과
+    - name: grep
+      match: corekeeper.log
+      regex: log (Accepted connection from|Connected to userid:|player .* connected|Disconnected from userid:)
+    
+    # 2) record_modifier: 필드 추가
+    - name: record_modifier
+      match: corekeeper.log
+      records:
+        source: corekeeper
+        pipeline: logtrail
+
+  outputs:
+    # 4) HTTP로 FastAPI 전송
+    - name: http
+      match: corekeeper.log
+      host: fastapi
+      port: 8000
+      uri: /ingest
+      format: json
+      json_date_key: ts
+      json_date_format: iso8601
+      header:
+        - Content-Type application/json
+    
+    # 5) 디버깅용 stdout (선택사항 - 필요시 주석 해제)
+    - name: stdout
+      match: corekeeper.log
+      format: json_lines

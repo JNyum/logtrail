@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  fastapi:
+    build:
+      context: ./fastapi
+      dockerfile: Dockerfile
+    container_name: logtrail_fastapi
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+      - ./fastapi/app:/app  # 개발 시 코드 수정 즉시 반영 (선택사항)
+    environment:
+      - DB_PATH=/data/playtime.db
+      - DISCORD_WEBHOOK_URL=<YOUR_DISCORD_WEBHOOK>
+    networks:
+      - log_trail
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  fluent-bit:
+    image: fluent/fluent-bit:3.2
+    container_name: logtrail_fluentbit
+    restart: unless-stopped
+    volumes:
+      - ./corekeeper_log:/var/log/corekeeper/Log.txt:ro  # 심볼릭 링크 마운트
+      - ./fluent_bit/fluent-bit.yaml:/fluent-bit/etc/fluent-bit.yaml:ro
+      - ./fluent_bit/parsers.conf:/fluent-bit/etc/parsers.conf:ro
+      - fluent-bit-state:/fluent-bit/state  # 읽기 위치 저장용
+    networks:
+      - log_trail
+    depends_on:
+      - fastapi
+    command: ["/fluent-bit/bin/fluent-bit", "-c", "/fluent-bit/etc/fluent-bit.yaml"]
+
+volumes:
+  fluent-bit-state:
+
+networks:
+  log_trail:
+    external: true
