@@ -3,6 +3,7 @@ from fastapi import FastAPI, Request
 import sqlite3
 from datetime import datetime, timedelta
 from contextlib import contextmanager
+from collections import deque
 import os, re, json, hashlib
 import asyncio
 import httpx
@@ -12,9 +13,11 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
 app = FastAPI()
 
-# 메모리 상태 관리: steamid <-> session_userid 매핑
-pending_connections = {}  # {steamid: session_userid}
-session_to_steam = {}     # {session_userid: (steamid, username, steam_name)}
+# 메모리 상태 관리
+# FIFO 큐: Accepted connection 순서대로 steamid를 쌓고, Connected to userid 순서대로 꺼냄
+pending_steamids = deque()        # deque of steamid (Accepted 되었지만 아직 userid 매핑 안 된 것)
+pending_connections = {}           # {session_userid: steamid} (userid 매핑됐지만 아직 player connected 안 된 것)
+session_to_steam = {}              # {session_userid: (steamid, username, steam_name)} (완전히 연결된 세션)
 
 def db():
     conn = sqlite3.connect(DB_PATH, isolation_level=None, timeout=10.0)
@@ -203,25 +206,24 @@ def split_if_needed(conn, steamid: str, session_userid: str, username: str, stea
         d += timedelta(days=1)
 
 def handle_accepted_connection(steamid: str):
-    """Accepted connection from {steamid} - 1단계"""
-    pending_connections[steamid] = None  # 아직 session_userid 모름
+    """Accepted connection from {steamid} - 1단계: FIFO 큐에 steamid 추가"""
+    pending_steamids.append(steamid)
     return {"ok": True, "action": "pending", "steamid": steamid}
 
-def handle_connected_to_userid(steamid: str, session_userid: str):
-    """Connected to userid:{session_userid} - 2단계"""
-    if steamid in pending_connections:
-        pending_connections[steamid] = session_userid
-    # 아직 username을 모르므로 대기
+def handle_connected_to_userid(session_userid: str):
+    """Connected to userid:{session_userid} - 2단계: 큐에서 가장 오래된 steamid를 꺼내서 매핑"""
+    if not pending_steamids:
+        return {"ok": True, "note": "no pending steamid in queue", "session_userid": session_userid}
+    
+    steamid = pending_steamids.popleft()  # FIFO: 먼저 들어온 steamid부터 매핑
+    pending_connections[session_userid] = steamid
+    
     return {"ok": True, "action": "mapped", "steamid": steamid, "session_userid": session_userid}
 
 async def handle_player_connected(conn, session_userid: str, username: str, now_dt: datetime):
     """[userid:{session_userid}] player {username} connected - 3단계 (실제 connect)"""
-    # session_userid로 steamid 찾기
-    steamid = None
-    for sid, sess_id in pending_connections.items():
-        if sess_id == session_userid:
-            steamid = sid
-            break
+    # pending_connections에서 steamid 찾기 (2단계에서 매핑된 것)
+    steamid = pending_connections.pop(session_userid, None)
     
     if not steamid:
         # pending에 없으면 이미 처리됐거나 순서가 꼬인 경우
@@ -236,10 +238,6 @@ async def handle_player_connected(conn, session_userid: str, username: str, now_
     
     # 메모리에 매핑 저장
     session_to_steam[session_userid] = (steamid, username, steam_name)
-    
-    # pending에서 제거
-    if steamid in pending_connections:
-        del pending_connections[steamid]
     
     # split 처리
     split_if_needed(conn, steamid, session_userid, username, steam_name, now_dt)
@@ -359,13 +357,8 @@ async def process_single_log(payload: dict):
     # 2) Connected to userid:{session_userid}
     session_userid = parse_session_userid_connect(raw)
     if session_userid:
-        # pending_connections에서 가장 최근 steamid 찾기
-        if pending_connections:
-            latest_steamid = list(pending_connections.keys())[-1]
-            result = handle_connected_to_userid(latest_steamid, session_userid)
-            return {**result, "log_id": log_id}
-        else:
-            return {"ok": True, "note": "no pending connection", "log_id": log_id}
+        result = handle_connected_to_userid(session_userid)
+        return {**result, "log_id": log_id}
     
     # 3) [userid:{session_userid}] player {username} connected
     session_userid, username = parse_player_connected(raw)
@@ -426,6 +419,7 @@ def health_check():
         
         return {
             "status": "healthy",
+            "pending_steamids_queue": len(pending_steamids),
             "pending_connections": len(pending_connections),
             "active_sessions": len(session_to_steam),
             "timestamp": datetime.now().isoformat()
